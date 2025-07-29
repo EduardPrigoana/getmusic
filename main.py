@@ -1,6 +1,7 @@
 from flask import Flask, jsonify
 from flask_cors import CORS
 import requests
+import re
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes and origins
@@ -22,7 +23,11 @@ def find_first_id_with_isrc(obj):
 
 @app.route('/search/<path:query>')
 def search(query):
-    query_encoded = query.replace('+', ' ').replace(' ', '%20')
+    # Strip everything after "feat" (case-insensitive)
+    stripped_query = re.split(r'\bfeat\b', query, flags=re.IGNORECASE)[0].strip()
+
+    # URL encode spaces as %20
+    query_encoded = stripped_query.replace('+', ' ').replace(' ', '%20')
     search_url = f"https://eu.qobuz.squid.wtf/api/get-music?q={query_encoded}&offset=0"
 
     try:
