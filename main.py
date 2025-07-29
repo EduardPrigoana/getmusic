@@ -1,98 +1,55 @@
-import re
-import logging
-from flask import Flask, jsonify, request, redirect
+from flask import Flask, jsonify
 from flask_cors import CORS
-import os
-import cloudscraper
+import requests
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Enable CORS for all routes and origins
 
-# Set up logging to stdout with DEBUG level
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+def find_first_id_with_isrc(obj):
+    if isinstance(obj, dict):
+        if 'id' in obj and 'isrc' in obj and obj['isrc'] and isinstance(obj['isrc'], str) and obj['isrc'].strip():
+            return obj['id']
+        for v in obj.values():
+            found = find_first_id_with_isrc(v)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = find_first_id_with_isrc(item)
+            if found is not None:
+                return found
+    return None
 
-scraper = cloudscraper.create_scraper()  # cloudscraper session to bypass Cloudflare
-
-@app.before_request
-def log_request_info():
-    logging.debug(f"Incoming request: {request.method} {request.url}")
-    logging.debug(f"Headers: {dict(request.headers)}")
-    if request.method == "POST":
-        logging.debug(f"Body: {request.get_data()}")
-
-@app.route('/')
-@app.route('/index')
-@app.route('/index.html')
-def redirect_to_prigoana():
-    logging.info("Redirecting to https://prigoana.com/")
-    return redirect('https://prigoana.com/', code=302)
-
-@app.route('/search')
-def search():
-    query = request.args.get('q')
-    logging.debug(f"Search query param q: {query}")
-
-    if not query:
-        logging.warning("Missing query parameter q")
-        return jsonify({'error': 'Missing query parameter q'}), 400
-
-    formatted_query = query.replace('+', ' ').replace('%26', '&').strip()
-    logging.debug(f"Formatted query after replacements: {formatted_query}")
-
-    lastfm_prefix = 'https://www.last.fm/music/'
-    if formatted_query.startswith(lastfm_prefix):
-        formatted_query = formatted_query[len(lastfm_prefix):]
-        logging.debug(f"Formatted query after removing last.fm prefix: {formatted_query}")
-
-    # Remove (feat ...) or (ft ...) suffixes
-    formatted_query = re.split(r'\s+\(?(feat|ft)\b', formatted_query, flags=re.IGNORECASE)[0].strip()
-    logging.debug(f"Formatted query after removing featuring info: {formatted_query}")
-
-    search_url = f'https://dab.yeet.su/api/search?q={formatted_query}&offset=0&type=track'
-    logging.info(f"Making search request to: {search_url}")
+@app.route('/search/<path:query>')
+def search(query):
+    query_encoded = query.replace('+', ' ').replace(' ', '%20')
+    search_url = f"https://eu.qobuz.squid.wtf/api/get-music?q={query_encoded}&offset=0"
 
     try:
-        search_response = scraper.get(search_url)
-        logging.debug(f"Search response status: {search_response.status_code}")
-        logging.debug(f"Search response headers: {dict(search_response.headers)}")
-        logging.debug(f"Search response text: {search_response.text}")
-        search_response.raise_for_status()
+        search_resp = requests.get(search_url)
+        search_resp.raise_for_status()
+        search_data = search_resp.json()
     except Exception as e:
-        logging.error(f"Search request failed: {e}")
-        return jsonify({'error': 'Failed to fetch track data'}), 500
+        return jsonify({"error": "Failed to fetch or parse search data", "details": str(e)}), 500
 
-    search_data = search_response.json()
-    if not search_data.get('tracks'):
-        logging.warning("No tracks found in search response")
-        return jsonify({'error': 'No tracks found'}), 404
+    track_id = find_first_id_with_isrc(search_data)
+    if track_id is None:
+        return jsonify({"error": "No track with valid 'id' and 'isrc' found"}), 404
 
-    track = search_data['tracks'][0]
-    track_id = track['id']
-    logging.debug(f"Selected track id: {track_id}")
-
-    stream_url = f'https://dab.yeet.su/api/stream?trackId={track_id}&quality=27'
-    logging.info(f"Making stream request to: {stream_url}")
+    download_url = f"https://eu.qobuz.squid.wtf/api/download-music?track_id={track_id}&quality=27"
 
     try:
-        stream_response = scraper.get(stream_url)
-        logging.debug(f"Stream response status: {stream_response.status_code}")
-        logging.debug(f"Stream response headers: {dict(stream_response.headers)}")
-        logging.debug(f"Stream response text: {stream_response.text}")
-        stream_response.raise_for_status()
+        download_resp = requests.get(download_url)
+        download_resp.raise_for_status()
+        download_data = download_resp.json()
     except Exception as e:
-        logging.error(f"Stream request failed: {e}")
-        return jsonify({'error': 'Failed to fetch stream data'}), 500
+        return jsonify({"error": "Failed to fetch or parse download data", "details": str(e)}), 500
 
-    stream_data = stream_response.json()
-    final_stream_url = stream_data.get('url')
-    if not final_stream_url:
-        logging.warning("No stream URL found in stream response")
-        return jsonify({'error': 'No stream URL found'}), 404
-
-    logging.info(f"Returning final stream URL: {final_stream_url}")
-    return jsonify({'stream_url': final_stream_url})
+    url = download_data.get('data', {}).get('url')
+    if url:
+        return jsonify({"url": url})
+    else:
+        return jsonify({"error": "URL not found in download response"}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))  # Use Render's assigned port or default to 5000
-    logging.info(f"Starting Flask app on port {port}")
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', debug=True)

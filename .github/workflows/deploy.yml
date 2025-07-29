@@ -1,0 +1,14 @@
+name: Qobuz Deploy Hook
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send GET request to Qobuz Deploy Hook
+        run: curl -X GET "$QOBUZ_DEPLOY_HOOK"
+        env:
+          QOBUZ_DEPLOY_HOOK: ${{ secrets.QOBUZ_DEPLOY_HOOK }}
