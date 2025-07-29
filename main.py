@@ -56,4 +56,5 @@ def search():
 
 
 if __name__ == '__main__':
-    app.run()
+    port = int(os.environ.get('PORT', 5000))  # Use Render's assigned port or default to 5000
+    app.run(host='0.0.0.0', port=port)
