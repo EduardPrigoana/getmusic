@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, abort
 from flask_cors import CORS
 import requests
 import re
@@ -21,8 +21,11 @@ def find_first_id_with_isrc(obj):
                 return found
     return None
 
-@app.route('/search/<path:query>')
-def search(query):
+def perform_search(query, quality):
+    # Validate quality
+    if quality not in {5,6,7,27}:
+        abort(400, description="Invalid quality value. Must be one of 5,6,7,27.")
+
     # Strip everything after "feat" (case-insensitive)
     stripped_query = re.split(r'\bfeat\b', query, flags=re.IGNORECASE)[0].strip()
 
@@ -41,7 +44,7 @@ def search(query):
     if track_id is None:
         return jsonify({"error": "No track with valid 'id' and 'isrc' found"}), 404
 
-    download_url = f"https://eu.qobuz.squid.wtf/api/download-music?track_id={track_id}&quality=27"
+    download_url = f"https://eu.qobuz.squid.wtf/api/download-music?track_id={track_id}&quality={quality}"
 
     try:
         download_resp = requests.get(download_url)
@@ -55,6 +58,11 @@ def search(query):
         return jsonify({"url": url})
     else:
         return jsonify({"error": "URL not found in download response"}), 500
+
+@app.route('/search/<path:query>', defaults={'quality': 27})
+@app.route('/search/<path:query>/quality/<int:quality>')
+def search(query, quality):
+    return perform_search(query, quality)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', debug=True)
