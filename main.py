@@ -1,15 +1,17 @@
 import re
-import requests
 import logging
 from flask import Flask, jsonify, request, redirect
 from flask_cors import CORS
 import os
+import cloudscraper
 
 app = Flask(__name__)
 CORS(app)
 
 # Set up logging to stdout with DEBUG level
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+
+scraper = cloudscraper.create_scraper()  # cloudscraper session to bypass Cloudflare
 
 @app.before_request
 def log_request_info():
@@ -50,12 +52,12 @@ def search():
     logging.info(f"Making search request to: {search_url}")
 
     try:
-        search_response = requests.get(search_url)
+        search_response = scraper.get(search_url)
         logging.debug(f"Search response status: {search_response.status_code}")
         logging.debug(f"Search response headers: {dict(search_response.headers)}")
         logging.debug(f"Search response text: {search_response.text}")
         search_response.raise_for_status()
-    except requests.RequestException as e:
+    except Exception as e:
         logging.error(f"Search request failed: {e}")
         return jsonify({'error': 'Failed to fetch track data'}), 500
 
@@ -72,12 +74,12 @@ def search():
     logging.info(f"Making stream request to: {stream_url}")
 
     try:
-        stream_response = requests.get(stream_url)
+        stream_response = scraper.get(stream_url)
         logging.debug(f"Stream response status: {stream_response.status_code}")
         logging.debug(f"Stream response headers: {dict(stream_response.headers)}")
         logging.debug(f"Stream response text: {stream_response.text}")
         stream_response.raise_for_status()
-    except requests.RequestException as e:
+    except Exception as e:
         logging.error(f"Stream request failed: {e}")
         return jsonify({'error': 'Failed to fetch stream data'}), 500
 
@@ -89,7 +91,6 @@ def search():
 
     logging.info(f"Returning final stream URL: {final_stream_url}")
     return jsonify({'stream_url': final_stream_url})
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))  # Use Render's assigned port or default to 5000
