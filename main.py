@@ -44,7 +44,7 @@ def perform_search(query, quality):
     if track_id is None:
         return jsonify({"error": "No track with valid 'id' and 'isrc' found"}), 404
 
-    download_url = f"https://eu.qobuz.squid.wtf/api/download-music?track_id={track_id}&quality={quality}"
+    download_url = f"https://us.qobuz.squid.wtf/api/download-music?track_id={track_id}&quality={quality}"
 
     try:
         download_resp = requests.get(download_url)
