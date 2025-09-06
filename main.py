@@ -5,8 +5,8 @@ import requests
 import re
 from json import JSONDecodeError
 
-SEARCH_URL_TEMPLATE = "https://eu.qobuz.squid.wtf/api/get-music"
-DOWNLOAD_URL_TEMPLATE = "https://us.qobuz.squid.wtf/api/download-music"
+SEARCH_URL_TEMPLATE = "https://qobuz.squid.wtf/api/get-music"
+DOWNLOAD_URL_TEMPLATE = "https://qobuz.squid.wtf/api/download-music"
 VALID_QUALITIES = {5, 6, 7, 27}
 DEFAULT_QUALITY = 27
 REQUEST_TIMEOUT = 10
