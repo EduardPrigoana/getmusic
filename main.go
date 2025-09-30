@@ -64,7 +64,7 @@ func (e *apiError) Error() string {
 func init() {
 	qobuzdlInstance = os.Getenv("QOBUZDL_INSTANCE")
 	if qobuzdlInstance == "" {
-		qobuzdlInstance = "https://eu.qqdl.site"
+		qobuzdlInstance = "https://qqdl.site"
 	}
 	qobuzdlInstance = strings.TrimRight(qobuzdlInstance, "/")
 
