@@ -3,297 +3,335 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
-	"strconv"
-	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
-	defaultPort     = "8080"
-	defaultQuality  = 27
-	requestTimeout  = 10 * time.Second
-	shutdownTimeout = 5 * time.Second
-	searchAPIPath   = "/api/get-music"
-	downloadAPIPath = "/api/download-music"
+	searchAPIURL = "https://tidal-api.binimum.org/search/"
+	trackAPIURL  = "https://tidal-api.binimum.org/track/"
+	cacheTTL     = 5 * time.Minute
+	httpTimeout  = 15 * time.Second
+	serverPort   = ":8080"
 )
 
-var (
-	qobuzdlInstance string
-	httpClient      *http.Client
-	validQualities  = map[int]struct{}{5: {}, 6: {}, 7: {}, 27: {}}
-	featRegex       = regexp.MustCompile(`(?i)\b(feat|ft)\b.*`)
-)
-
-type DownloadResponse struct {
-	Data struct {
-		URL string `json:"url"`
-	} `json:"data"`
+type TrackItem struct {
+	ID           int    `json:"id"`
+	AudioQuality string `json:"audioQuality"`
 }
 
-type SuccessResponse struct {
+type SearchResponse struct {
+	Items []TrackItem `json:"items"`
+}
+
+type TrackURLItem struct {
+	OriginalTrackURL string `json:"OriginalTrackUrl"`
+}
+
+type FinalResponse struct {
 	URL string `json:"url"`
 }
 
-type ErrorDetail struct {
-	Code        int    `json:"code"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-}
-
 type ErrorResponse struct {
-	Error ErrorDetail `json:"error"`
+	Error string `json:"error"`
 }
 
-type apiError struct {
-	statusCode int
-	message    string
+type cacheItem struct {
+	value     string
+	expiresAt time.Time
 }
 
-func (e *apiError) Error() string {
-	return e.message
+type Cache struct {
+	mu    sync.RWMutex
+	items map[string]cacheItem
 }
 
-func init() {
-	qobuzdlInstance = os.Getenv("QOBUZDL_INSTANCE")
-	if qobuzdlInstance == "" {
-		qobuzdlInstance = "https://qobuz.squid.wtf"
-	}
-	qobuzdlInstance = strings.TrimRight(qobuzdlInstance, "/")
-
-	httpClient = &http.Client{
-		Timeout: requestTimeout,
+func NewCache() *Cache {
+	return &Cache{
+		items: make(map[string]cacheItem),
 	}
 }
 
-func findFirstIDWithISRC(data interface{}) (string, bool) {
-	switch val := data.(type) {
-	case map[string]interface{}:
-		idVal, idOk := val["id"]
-		isrcVal, isrcOk := val["isrc"]
-
-		if idOk && isrcOk {
-			if isrcStr, ok := isrcVal.(string); ok && strings.TrimSpace(isrcStr) != "" {
-				if idFloat, ok := idVal.(float64); ok {
-					return fmt.Sprintf("%.0f", idFloat), true
-				}
-				if idStr, ok := idVal.(string); ok {
-					return idStr, true
-				}
-			}
-		}
-
-		for _, v := range val {
-			if id, found := findFirstIDWithISRC(v); found {
-				return id, true
-			}
-		}
-
-	case []interface{}:
-		for _, item := range val {
-			if id, found := findFirstIDWithISRC(item); found {
-				return id, true
-			}
-		}
-	}
-
-	return "", false
-}
-
-func performSearch(ctx context.Context, query string, quality int) (string, *apiError) {
-	if _, ok := validQualities[quality]; !ok {
-		return "", &apiError{http.StatusBadRequest, fmt.Sprintf("Invalid quality value. Must be one of %v.", getValidQualitiesList())}
-	}
-
-	strippedQuery := strings.TrimSpace(featRegex.Split(query, 2)[0])
-	if strippedQuery == "" {
-		return "", &apiError{http.StatusBadRequest, "Search query is empty after cleaning."}
-	}
-
-	searchURL, _ := url.Parse(qobuzdlInstance + searchAPIPath)
-	q := searchURL.Query()
-	q.Set("q", strippedQuery)
-	q.Set("offset", "0")
-	searchURL.RawQuery = q.Encode()
-
-	var searchData interface{}
-	req, _ := http.NewRequestWithContext(ctx, "GET", searchURL.String(), nil)
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		log.Printf("Error contacting search service: %v", err)
-		return "", &apiError{http.StatusServiceUnavailable, "The external search service is unavailable."}
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Search service returned non-200 status: %d", resp.StatusCode)
-		return "", &apiError{http.StatusServiceUnavailable, "The external search service returned an error."}
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&searchData); err != nil {
-		log.Printf("Error decoding search service response: %v", err)
-		return "", &apiError{http.StatusInternalServerError, "Received an invalid response from the search service."}
-	}
-
-	trackID, found := findFirstIDWithISRC(searchData)
+func (c *Cache) Get(key string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	item, found := c.items[key]
 	if !found {
-		return "", &apiError{http.StatusNotFound, "No track with a valid ID and ISRC was found."}
+		return "", false
 	}
-
-	downloadURL, _ := url.Parse(qobuzdlInstance + downloadAPIPath)
-	q = downloadURL.Query()
-	q.Set("track_id", trackID)
-	q.Set("quality", strconv.Itoa(quality))
-	downloadURL.RawQuery = q.Encode()
-
-	var downloadData DownloadResponse
-	req, _ = http.NewRequestWithContext(ctx, "GET", downloadURL.String(), nil)
-	resp, err = httpClient.Do(req)
-	if err != nil {
-		log.Printf("Error contacting download service: %v", err)
-		return "", &apiError{http.StatusServiceUnavailable, "The external download service is unavailable."}
+	if time.Now().After(item.expiresAt) {
+		return "", false
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Download service returned non-200 status: %d", resp.StatusCode)
-		return "", &apiError{http.StatusServiceUnavailable, "The external download service returned an error."}
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&downloadData); err != nil {
-		log.Printf("Error decoding download service response: %v", err)
-		return "", &apiError{http.StatusInternalServerError, "Received an invalid response from the download service."}
-	}
-
-	if downloadData.Data.URL == "" {
-		return "", &apiError{http.StatusInternalServerError, "Download URL not found in the final API response."}
-	}
-
-	return downloadData.Data.URL, nil
+	return item.value, true
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-func searchHandler(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/search/")
-	path = strings.Trim(path, "/")
-
-	if path == "" {
-		writeJSONError(w, http.StatusBadRequest, "Search query is missing.")
-		return
-	}
-
-	query := path
-	quality := defaultQuality
-
-	if qualityIndex := strings.LastIndex(path, "/quality/"); qualityIndex != -1 {
-		potentialQualityStr := path[qualityIndex+len("/quality/"):]
-		if parsedQuality, err := strconv.Atoi(potentialQualityStr); err == nil {
-			query = path[:qualityIndex]
-			quality = parsedQuality
-		}
-	}
-
-	unescapedQuery, err := url.PathUnescape(query)
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "Invalid URL-encoded query.")
-		return
-	}
-	if unescapedQuery == "" {
-		writeJSONError(w, http.StatusBadRequest, "Search query is empty.")
-		return
-	}
-
-	downloadURL, apiErr := performSearch(r.Context(), unescapedQuery, quality)
-	if apiErr != nil {
-		writeJSONError(w, apiErr.statusCode, apiErr.message)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	encoder := json.NewEncoder(w)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(SuccessResponse{URL: downloadURL}); err != nil {
-		log.Printf("Error encoding success response: %v", err)
+func (c *Cache) Set(key string, value string, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items[key] = cacheItem{
+		value:     value,
+		expiresAt: time.Now().Add(ttl),
 	}
 }
 
-func writeJSONError(w http.ResponseWriter, code int, description string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	encoder := json.NewEncoder(w)
-	encoder.SetEscapeHTML(false)
-	_ = encoder.Encode(ErrorResponse{
-		Error: ErrorDetail{
-			Code:        code,
-			Name:        http.StatusText(code),
-			Description: description,
-		},
-	})
-}
-
-func getValidQualitiesList() []int {
-	keys := make([]int, 0, len(validQualities))
-	for k := range validQualities {
-		keys = append(keys, k)
-	}
-	return keys
+type App struct {
+	logger *slog.Logger
+	client *http.Client
+	cache  *Cache
+	sf     *singleflight.Group
 }
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = defaultPort
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	httpClient := &http.Client{
+		Timeout: httpTimeout,
+	}
+	app := &App{
+		logger: logger,
+		client: httpClient,
+		cache:  NewCache(),
+		sf:     &singleflight.Group{},
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/search/", searchHandler)
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	r.Get("/search/{query}", app.searchHandler)
 
 	server := &http.Server{
-		Addr:    ":" + port,
-		Handler: corsMiddleware(mux),
+		Addr:    serverPort,
+		Handler: r,
 	}
-
-	go func() {
-		log.Printf("Server starting on port %s", port)
-		log.Printf("Using QobuzDL instance: %s", qobuzdlInstance)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Could not listen on %s: %v\n", port, err)
-		}
-	}()
 
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, syscall.SIGINT, syscall.SIGTERM)
-	<-stopChan
-	log.Println("Shutting down server...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	go func() {
+		logger.Info("Server starting", "port", serverPort)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("Server failed to start", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-stopChan
+	logger.Info("Shutting down server gracefully...")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Server shutdown failed: %+v", err)
+		logger.Error("Graceful shutdown failed", "error", err)
+		os.Exit(1)
 	}
-	log.Println("Server gracefully stopped")
+	logger.Info("Server stopped")
+}
+
+func (app *App) searchHandler(w http.ResponseWriter, r *http.Request) {
+	query := chi.URLParam(r, "query")
+	if query == "" {
+		app.jsonError(w, "Search query is required", http.StatusBadRequest)
+		return
+	}
+
+	log := app.logger.With(slog.String("query", query), slog.String("request_id", middleware.GetReqID(r.Context())))
+	log.Info("Received search request")
+
+	if cachedURL, found := app.cache.Get(query); found {
+		log.Info("Cache hit")
+		app.jsonResponse(w, FinalResponse{URL: cachedURL}, http.StatusOK)
+		return
+	}
+	log.Info("Cache miss")
+
+	v, err, _ := app.sf.Do(query, func() (interface{}, error) {
+		tracks, err := app.searchTracks(r.Context(), query)
+		if err != nil {
+			return nil, err
+		}
+
+		finalURL, err := app.findFirstValidTrackURL(r.Context(), tracks, log)
+		if err != nil {
+			return nil, err
+		}
+
+		app.cache.Set(query, finalURL, cacheTTL)
+		log.Info("Result cached", "ttl", cacheTTL.String())
+		return finalURL, nil
+	})
+
+	if err != nil {
+		var statusErr *statusError
+		if errors.As(err, &statusErr) {
+			log.Warn("Failed to find track URL", "error", statusErr.Error())
+			app.jsonError(w, statusErr.Error(), statusErr.Code)
+		} else {
+			log.Error("Internal error during singleflight execution", "error", err)
+			app.jsonError(w, "Internal server error", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	finalURL := v.(string)
+	app.jsonResponse(w, FinalResponse{URL: finalURL}, http.StatusOK)
+}
+
+func (app *App) findFirstValidTrackURL(ctx context.Context, tracks []TrackItem, log *slog.Logger) (string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	urlChan := make(chan string, 1)
+	var wg sync.WaitGroup
+
+	for i, track := range tracks {
+		wg.Add(1)
+		go func(track TrackItem, attempt int) {
+			defer wg.Done()
+			trackLog := log.With(slog.Int("track_id", track.ID), slog.Int("attempt", attempt))
+
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			finalURL, err := app.getTrackURL(ctx, track.ID, track.AudioQuality)
+			if err != nil {
+				var statusErr *statusError
+				if errors.As(err, &statusErr) && statusErr.Code == http.StatusNotFound {
+					trackLog.Warn("Track details not found (404), this goroutine will exit")
+				} else {
+					trackLog.Error("Unexpected error getting track URL", "error", err)
+				}
+				return
+			}
+
+			select {
+			case urlChan <- finalURL:
+			case <-ctx.Done():
+			}
+		}(track, i+1)
+	}
+
+	go func() {
+		wg.Wait()
+		close(urlChan)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return "", &statusError{http.StatusNotFound, errors.New("operation cancelled before a result was found")}
+	case finalURL, ok := <-urlChan:
+		if ok {
+			cancel()
+			return finalURL, nil
+		}
+		log.Warn("Processed all search results but found no valid track URL")
+		return "", &statusError{http.StatusNotFound, errors.New("track not found")}
+	}
+}
+
+func (app *App) searchTracks(ctx context.Context, query string) ([]TrackItem, error) {
+	encodedQuery := url.QueryEscape(query)
+	reqURL := fmt.Sprintf("%s?s=%s", searchAPIURL, encodedQuery)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create search request: %w", err)
+	}
+
+	resp, err := app.client.Do(req)
+	if err != nil {
+		return nil, &statusError{http.StatusBadGateway, fmt.Errorf("search API request failed: %w", err)}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, &statusError{http.StatusBadGateway, fmt.Errorf("search API returned non-200 status: %d", resp.StatusCode)}
+	}
+
+	var searchResp SearchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&searchResp); err != nil {
+		return nil, fmt.Errorf("failed to decode search response: %w", err)
+	}
+
+	if len(searchResp.Items) == 0 {
+		return nil, &statusError{http.StatusNotFound, errors.New("track not found")}
+	}
+
+	return searchResp.Items, nil
+}
+
+func (app *App) getTrackURL(ctx context.Context, id int, quality string) (string, error) {
+	reqURL := fmt.Sprintf("%s?id=%d&quality=%s", trackAPIURL, id, quality)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create track URL request: %w", err)
+	}
+
+	resp, err := app.client.Do(req)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return "", err
+		}
+		return "", &statusError{http.StatusBadGateway, fmt.Errorf("track URL API request failed: %w", err)}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", &statusError{http.StatusNotFound, fmt.Errorf("upstream API returned 404 for track ID %d", id)}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", &statusError{http.StatusBadGateway, fmt.Errorf("track URL API returned non-200 status: %d", resp.StatusCode)}
+	}
+
+	var trackInfo []TrackURLItem
+	if err := json.NewDecoder(resp.Body).Decode(&trackInfo); err != nil {
+		return "", fmt.Errorf("failed to decode track URL response: %w", err)
+	}
+
+	for _, item := range trackInfo {
+		if item.OriginalTrackURL != "" {
+			return item.OriginalTrackURL, nil
+		}
+	}
+
+	return "", &statusError{http.StatusBadGateway, errors.New("could not find OriginalTrackUrl in upstream API response")}
+}
+
+type statusError struct {
+	Code int
+	Err  error
+}
+
+func (se *statusError) Error() string {
+	return se.Err.Error()
+}
+
+func (app *App) jsonError(w http.ResponseWriter, message string, code int) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(ErrorResponse{Error: message})
+}
+
+func (app *App) jsonResponse(w http.ResponseWriter, data interface{}, code int) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(data)
 }
